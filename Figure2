@@ -1,0 +1,128 @@
+# 1. Set data path
+data_path <- "your.path"
+
+# 2. Define function to unzip and read CSVs
+read_gbd_zip <- function(zip_file) {
+  tmp_dir <- tempfile("gbd_zip_")
+  dir.create(tmp_dir)
+  on.exit(unlink(tmp_dir, recursive = TRUE), add = TRUE)
+  
+  # List all csv files inside the zip
+  zip_list <- utils::unzip(zip_file, list = TRUE)
+  csv_names <- zip_list$Name[grepl("\\.csv$", zip_list$Name, ignore.case = TRUE)]
+  
+  if (length(csv_names) == 0) return(data.table())
+  
+  # Unzip and read
+  utils::unzip(zip_file, files = csv_names, exdir = tmp_dir)
+  csv_paths <- list.files(tmp_dir, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
+  
+  # Use fread to read and rbindlist to combine efficiently
+  out <- rbindlist(lapply(csv_paths, fread), fill = TRUE)
+  out[, source_zip := basename(zip_file)]
+  out
+}
+
+# 3. Define function to read zips while excluding specific files
+read_gbd_zips_filtered <- function(path) {
+  # List all zip files
+  all_zip_files <- list.files(path, pattern = "\\.zip$", full.names = TRUE)
+  
+  # Define the file to exclude
+  exclude_file <- "IHME-GBD_2023_DATA-4ee9b1e1-1.zip"
+  
+  # Filter logic
+  target_zip_files <- all_zip_files[!grepl(exclude_file, basename(all_zip_files))]
+  
+  if (length(target_zip_files) == 0) {
+    stop("No valid .zip files found.", call. = FALSE)
+  }
+  
+  message("Processing the following archives:")
+  cat(paste(basename(target_zip_files), collapse = "\n"), "\n")
+  # Read and combine
+  rbindlist(lapply(target_zip_files, read_gbd_zip), fill = TRUE)
+}
+# 4. Execute reading
+gbd_all <- read_gbd_zips_filtered(data_path)
+colnames(gbd_all)
+
+library(dplyr)
+library(readr)
+pop_zip_path <- "your.path/IHME-GBD_2023_DATA-4ee9b1e1-1.zip"
+tmp_dir <- tempdir()
+unzip(pop_zip_path, exdir = tmp_dir)
+pop_file <- list.files(tmp_dir, pattern = "*.csv", full.names = TRUE)
+gbd_pop <- read_csv(pop_file[1])
+
+
+gbdall <- gbd_all %>%
+  left_join(gbd_pop %>% select(location_id, year, age_id, sex_id, val), 
+            by = c("location_id", "year", "age_id", "sex_id"),
+            suffix = c("_rate", "_pop")) %>%
+  rename(population = val_pop) 
+
+library(dplyr)
+colnames(gbdall)
+  # 1. Filter data
+  plot_data_final <- gbdall %>%
+  filter(
+    metric_name == "Rate",
+    sex_name == "Female",
+    cause_name == "Cardiovascular diseases",
+    age_id %in% c(14, 15) # 45-49 and 50-54
+  ) %>%
+  # 2. Convert data types
+  mutate(
+    val_rate = as.numeric(val_rate),
+    population = as.numeric(population)
+  ) %>%
+  # 3. Calculate weighted average for 45-54 age group
+  group_by(location_name, year, measure_name) %>%
+  summarise(
+    val = sum(val_rate * population, na.rm = TRUE) / sum(population, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  # 4. Rename for plotting
+  rename(
+    location_label = location_name,
+    measure = measure_name
+  ) %>%
+  # 5. Factor levels for plotting order
+  mutate(location_label = factor(location_label, 
+                                 levels = c("Global", "East Asia", "China", "Japan", "Republic of Korea", 
+                                            "Democratic People's Republic of Korea", "Mongolia", "Taiwan"))) %>%
+  # 6. Filter measures
+  filter(measure %in% c("Deaths", "Incidence", "Prevalence"))
+
+library(ggplot2)
+library(patchwork)
+
+draw_lancet_block_enlarged <- function(target_measure, color_code, plot_title) {
+  plot_data_final %>%
+    filter(measure == target_measure) %>%
+    ggplot(aes(x = year, y = val, color = location_label)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 0.5) +
+    scale_color_brewer(palette = "Set1") + 
+    theme_minimal() +
+    labs(title = plot_title, x = "Year", y = "Rate") +
+    theme(
+      legend.position = "bottom",
+      panel.grid.minor = element_blank(),
+      text = element_text(family = "serif") # Lancet standard serif font
+    )
+}
+
+# Generate plots for each measure
+p1 <- draw_lancet_block_enlarged("Deaths", "#E41A1C", "Mortality Rate")
+p2 <- draw_lancet_block_enlarged("Incidence", "#FF7F00", "Incidence Rate")
+p3 <- draw_lancet_block_enlarged("Prevalence", "#377EB8", "Prevalence Rate")
+
+# Combine plots
+figure2 <- (p1 + p2 + p3) + plot_layout(guides = 'collect') & theme(legend.position = 'bottom')
+print(final_plot)
+ggsave("figure2_.tiff", 
+       plot = figure2, 
+       width = 22, height = 12, units = "in", 
+       dpi = 300, compression = "lzw")
