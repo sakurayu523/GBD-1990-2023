@@ -1,0 +1,151 @@
+# 1. Set data path
+data_path <- "./data"
+
+# 2. Define function to unzip and read CSVs
+read_gbd_zip <- function(zip_file) {
+  tmp_dir <- tempfile("gbd_zip_")
+  dir.create(tmp_dir)
+  on.exit(unlink(tmp_dir, recursive = TRUE), add = TRUE)
+  
+  # List all csv files inside the zip
+  zip_list <- utils::unzip(zip_file, list = TRUE)
+  csv_names <- zip_list$Name[grepl("\\.csv$", zip_list$Name, ignore.case = TRUE)]
+  
+  if (length(csv_names) == 0) return(data.table())
+  
+  # Unzip and read
+  utils::unzip(zip_file, files = csv_names, exdir = tmp_dir)
+  csv_paths <- list.files(tmp_dir, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
+  
+  # Use fread to read and rbindlist to combine efficiently
+  out <- rbindlist(lapply(csv_paths, fread), fill = TRUE)
+  out[, source_zip := basename(zip_file)]
+  out
+}
+
+# 3. Define function to read zips while excluding specific files
+read_gbd_zips_filtered <- function(path) {
+  # List all zip files
+  all_zip_files <- list.files(path, pattern = "\\.zip$", full.names = TRUE)
+  
+  # Define the file to exclude
+  exclude_file <- "IHME-GBD_2023_DATA-4ee9b1e1-1.zip"
+  
+  # Filter logic
+  target_zip_files <- all_zip_files[!grepl(exclude_file, basename(all_zip_files))]
+  
+  if (length(target_zip_files) == 0) {
+    stop("No valid .zip files found.", call. = FALSE)
+  }
+  
+  message("Processing the following archives:")
+  cat(paste(basename(target_zip_files), collapse = "\n"), "\n")
+  
+  # Read and combine
+  rbindlist(lapply(target_zip_files, read_gbd_zip), fill = TRUE)
+}
+
+# 4. Execute reading
+gbd_all <- read_gbd_zips_filtered(data_path)
+
+# Load libraries
+library(tidyverse)
+library(gt)
+
+# ==========================================================
+# 1. Basic Configuration
+# ==========================================================
+location_order <- c(
+  "Global", "East Asia", "China", "Japan", 
+  "Republic of Korea", "Democratic People's Republic of Korea", "Mongolia"
+)
+
+measure_order <- c(
+  "Deaths", "Incidence", "Prevalence",
+  "DALYs (Disability-Adjusted Life Years)",
+  "YLLs (Years of Life Lost)",
+  "YLDs (Years Lived with Disability)"
+)
+
+measure_group1 <- c("Deaths", "Incidence", "Prevalence")
+measure_group2 <- c(
+  "DALYs (Disability-Adjusted Life Years)",
+  "YLLs (Years of Life Lost)",
+  "YLDs (Years Lived with Disability)"
+)
+
+# ==========================================================
+# 3. Process Data
+# ==========================================================
+table_base <- gbd_all %>%
+  filter(sex_name == "Female", 
+         age_name %in% c("45-49 years", "50-54 years"), 
+         location_name %in% location_order) %>%
+  group_by(location_name, measure_name, year, metric_name) %>%
+  summarise(val = mean(val, na.rm = TRUE), 
+            lower = mean(lower, na.rm = TRUE), 
+            upper = mean(upper, na.rm = TRUE), .groups = "drop") %>%
+  rename(location = location_name, measure = measure_name, metric = metric_name)
+
+# EAPC Calculation
+eapc_res <- table_base %>%
+  filter(metric == "Rate") %>%
+  group_by(location, measure) %>%
+  do({
+    fit <- lm(log(val) ~ year, data = .)
+    beta <- coef(fit)["year"]
+    se <- summary(fit)$coefficients["year", "Std. Error"]
+    val_eapc <- 100 * (exp(beta) - 1)
+    low_eapc <- 100 * (exp(beta - 1.96 * se) - 1)
+    upp_eapc <- 100 * (exp(beta + 1.96 * se) - 1)
+    data.frame(eapc_fmt = paste0(sprintf("%.2f", val_eapc), " (", sprintf("%.2f", low_eapc), " to ", sprintf("%.2f", upp_eapc), ")"))
+  })
+
+table_final <- table_base %>%
+  filter(year %in% c(1990, 2023)) %>%
+  mutate(ui_text = paste0(sprintf("%.2f", val), " (", sprintf("%.2f", lower), " to ", sprintf("%.2f", upper), ")")) %>%
+  select(measure, location, year, metric, ui_text) %>%
+  pivot_wider(names_from = c(year, metric), values_from = ui_text) %>%
+  left_join(eapc_res, by = c("location", "measure"))
+
+# ==========================================================
+# 4. GT Generation Function
+# ==========================================================
+make_gt <- function(df) {
+  df %>%
+    mutate(measure = factor(measure, levels = measure_order),
+           location = factor(location, levels = location_order)) %>%
+    arrange(measure, location) %>%
+    group_by(measure) %>%
+    gt() %>%
+    cols_label(
+      location = "Location",
+      `1990_Number` = "Number (95% UI)",
+      `1990_Rate` = "ASR per 100,000 (95% UI)",
+      `2023_Number` = "Number (95% UI)",
+      `2023_Rate` = "ASR per 100,000 (95% UI)",
+      eapc_fmt = "EAPC (95% UI)"
+    ) %>%
+    tab_spanner(label = "1990", columns = c(`1990_Number`, `1990_Rate`)) %>%
+    tab_spanner(label = "2023", columns = c(`2023_Number`, `2023_Rate`)) %>%
+    tab_spanner(label = "1990-2023", columns = c(eapc_fmt)) %>%
+    tab_options(
+      table.font.names = "Arial",
+      table.font.size = px(12),
+      table.border.top.width = px(2),
+      table.border.bottom.width = px(2),
+      column_labels.border.bottom.width = px(1),
+      data_row.padding = px(4)
+    ) %>%
+    cols_align(align = "left", columns = location)
+}
+
+# Output results
+table1 <- make_gt(table_final %>% filter(measure %in% measure_group1))
+table2 <- make_gt(table_final %>% filter(measure %in% measure_group2))
+print(table1)
+print(table2)
+library(gt)
+library(dplyr)
+gtsave(table1, "table1.rtf")
+gtsave(table2, "table2.rtf")
