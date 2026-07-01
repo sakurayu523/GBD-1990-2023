@@ -1,5 +1,34 @@
+library(dplyr)
+library(readr)
+library(purrr)
+
+# 1. 设置路径
+data_path <- "your path"
+
+# 2. 获取所有 zip 文件，并排除你指定的那个文件
+all_zip_files <- list.files(path = data_path, pattern = "\\.zip$", full.names = TRUE)
+target_zip <- "IHME-GBD_2023_DATA-4ee9b1e1-1.zip" # 目标文件名
+
+# 筛选掉不需要的文件
+files_to_merge <- all_zip_files[!grepl(target_zip, all_zip_files)]
+
+# 3. 定义读取函数
+read_zip_to_df <- function(zip_file) {
+  files_in_zip <- unzip(zip_file, list = TRUE)$Name
+  csv_file <- files_in_zip[grep("\\.csv$", files_in_zip)]
+  
+  # 读取 csv，强制字符型以防止列类型冲突
+  data <- read_csv(unz(zip_file, csv_file), col_types = cols(.default = "c"))
+  return(data)
+}
+
+# 4. 批量执行合并
+all_gbd_data_no_pop <- map_dfr(files_to_merge, read_zip_to_df)
+
+library(data.table)  # 必须添加这行，否则找不到 rbindlist
+library(utils)       # 处理 zip
 # 1. Set data path
-data_path <- "your.path"
+data_path <- "F:/yu/GBD/female/data"
 
 # 2. Define function to unzip and read CSVs
 read_gbd_zip <- function(zip_file) {
@@ -49,7 +78,7 @@ colnames(gbd_all)
 
 library(dplyr)
 library(readr)
-pop_zip_path <- "your.path/IHME-GBD_2023_DATA-4ee9b1e1-1.zip"
+pop_zip_path <- "your path/IHME-GBD_2023_DATA-4ee9b1e1-1.zip"
 tmp_dir <- tempdir()
 unzip(pop_zip_path, exdir = tmp_dir)
 pop_file <- list.files(tmp_dir, pattern = "*.csv", full.names = TRUE)
@@ -61,11 +90,115 @@ gbdall <- gbd_all %>%
             by = c("location_id", "year", "age_id", "sex_id"),
             suffix = c("_rate", "_pop")) %>%
   rename(population = val_pop) 
+colnames(gbdall)
+library(data.table)
+
+# 1. 确保是 data.table
+setDT(gbdall)
+
+# 2. 定义分组维度（排除数值列）
+# 因为 val_rate 和 population 都是数值，不应该放在 by 里面
+cols_to_group <- c("location_name", "year", "sex_id", "sex_name", 
+                   "age_id", "age_name", "cause_id", "cause_name", 
+                   "measure_id", "measure_name", "metric_id", "metric_name")
+
+# 3. 执行合并
+# 将台湾名改为中国，并对数值列求和
+gbdall[location_name == "Taiwan", location_name := "China"]
+
+gbd_final <- gbdall[, .(
+  val_rate = sum(val_rate, na.rm = TRUE),
+  population = sum(population, na.rm = TRUE)
+), by = cols_to_group]
+
+# 4. 验证结果
+head(gbd_final)
+
 
 library(dplyr)
-colnames(gbdall)
-  # 1. Filter data
-  plot_data_final <- gbdall %>%
+library(readr)
+library(purrr)
+library(data.table)
+
+# 1. Set data path
+data_path <- "F:/yu/GBD/female/data"
+
+# 2. Define function to unzip and read CSVs efficiently
+read_gbd_zip <- function(zip_file) {
+  tmp_dir <- tempfile("gbd_zip_")
+  dir.create(tmp_dir)
+  on.exit(unlink(tmp_dir, recursive = TRUE), add = TRUE)
+  
+  # List and identify csv files
+  zip_list <- utils::unzip(zip_file, list = TRUE)
+  csv_names <- zip_list$Name[grepl("\\.csv$", zip_list$Name, ignore.case = TRUE)]
+  
+  if (length(csv_names) == 0) return(data.table())
+  
+  # Unzip and read
+  utils::unzip(zip_file, files = csv_names, exdir = tmp_dir)
+  csv_paths <- list.files(tmp_dir, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
+  
+  # Use fread for fast reading and combine
+  out <- rbindlist(lapply(csv_paths, fread), fill = TRUE)
+  out[, source_zip := basename(zip_file)]
+  return(out)
+}
+
+# 3. Define function to read zips while excluding the specific population file
+read_gbd_zips_filtered <- function(path) {
+  all_zip_files <- list.files(path, pattern = "\\.zip$", full.names = TRUE)
+  exclude_file <- "IHME-GBD_2023_DATA-4ee9b1e1-1.zip"
+  
+  target_zip_files <- all_zip_files[!grepl(exclude_file, basename(all_zip_files))]
+  
+  if (length(target_zip_files) == 0) {
+    stop("No valid .zip files found.", call. = FALSE)
+  }
+  
+  message("Processing the following archives:")
+  cat(paste(basename(target_zip_files), collapse = "\n"), "\n")
+  
+  rbindlist(lapply(target_zip_files, read_gbd_zip), fill = TRUE)
+}
+
+# 4. Execute reading
+gbd_all <- read_gbd_zips_filtered(data_path)
+
+# 5. Load and join population data
+pop_zip_path <- file.path(data_path, "IHME-GBD_2023_DATA-4ee9b1e1-1.zip")
+tmp_dir_pop <- tempdir()
+unzip(pop_zip_path, exdir = tmp_dir_pop)
+pop_file <- list.files(tmp_dir_pop, pattern = "\\.csv$", full.names = TRUE)
+gbd_pop <- read_csv(pop_file[1])
+
+# Merge datasets
+gbd_all_joined <- gbd_all %>%
+  left_join(gbd_pop %>% select(location_id, year, age_id, sex_id, val), 
+            by = c("location_id", "year", "age_id", "sex_id"),
+            suffix = c("_rate", "_pop")) %>%
+  rename(population = val_pop)
+
+# 6. Data Aggregation using data.table
+setDT(gbd_all_joined)
+
+# Define grouping columns (excluding numeric values)
+cols_to_group <- c("location_name", "year", "sex_id", "sex_name", 
+                   "age_id", "age_name", "cause_id", "cause_name", 
+                   "measure_id", "measure_name", "metric_id", "metric_name")
+
+# Rename "Taiwan" to "China" and aggregate
+gbd_all_joined[location_name == "Taiwan", location_name := "China"]
+
+gbd_final <- gbd_all_joined[, .(
+  val_rate = sum(val_rate, na.rm = TRUE),
+  population = sum(population, na.rm = TRUE)
+), by = cols_to_group]
+
+# 7. Verify result
+head(gbd_final)
+# 1. Filter data
+plot_data_final <- gbd_final %>%
   filter(
     metric_name == "Rate",
     sex_name == "Female",
@@ -118,11 +251,17 @@ draw_lancet_block_enlarged <- function(target_measure, color_code, plot_title) {
 p1 <- draw_lancet_block_enlarged("Deaths", "#E41A1C", "Mortality Rate")
 p2 <- draw_lancet_block_enlarged("Incidence", "#FF7F00", "Incidence Rate")
 p3 <- draw_lancet_block_enlarged("Prevalence", "#377EB8", "Prevalence Rate")
-
+plot
 # Combine plots
 figure2 <- (p1 + p2 + p3) + plot_layout(guides = 'collect') & theme(legend.position = 'bottom')
-print(final_plot)
-ggsave("figure2_.tiff", 
+print(figure2)
+ggsave("figure2.tiff", 
        plot = figure2, 
        width = 22, height = 12, units = "in", 
        dpi = 300, compression = "lzw")
+
+ggsave("figure2.pdf", 
+       plot = figure2, 
+       width = 22, height = 12, 
+       units = "in", 
+       dpi = 300)
