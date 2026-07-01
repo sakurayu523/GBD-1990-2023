@@ -1,40 +1,97 @@
-library(tidyverse)
+library(dplyr)
+library(readr)
+library(purrr)
 library(data.table)
+library(ggplot2)
+library(patchwork)
 library(gt)
+library(tidyr)
 
-# 1. Data Path & Reading Function
-data_path <- "F:\\yu\\GBD\\female\\data"
+# ==========================================================
+# PART 1: Data Loading & Initial Merging
+# ==========================================================
+data_path <- "your path."
 
+# Function to read and combine zip files
 read_gbd_zip <- function(zip_file) {
-  tmp_dir <- tempfile("gbd_")
+  tmp_dir <- tempfile("gbd_zip_")
   dir.create(tmp_dir)
-  on.exit(unlink(tmp_dir, recursive = TRUE))
-  
+  on.exit(unlink(tmp_dir, recursive = TRUE), add = TRUE)
   zip_list <- utils::unzip(zip_file, list = TRUE)
   csv_names <- zip_list$Name[grepl("\\.csv$", zip_list$Name, ignore.case = TRUE)]
-  if (length(csv_names) == 0) return(NULL)
-  
+  if (length(csv_names) == 0) return(data.table())
   utils::unzip(zip_file, files = csv_names, exdir = tmp_dir)
-  csv_paths <- list.files(tmp_dir, pattern = "\\.csv$", full.names = TRUE)
+  csv_paths <- list.files(tmp_dir, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
   out <- rbindlist(lapply(csv_paths, fread), fill = TRUE)
-  out
+  out[, source_zip := basename(zip_file)]
+  return(out)
 }
 
-# 2. Process Data
-# Assume 'gbd_all' is already loaded via your read function
-# Filter: Female, 45-54, Specific Locations
-table_raw <- gbd_all %>%
+# 1.1 Read GBD raw data (excluding population file)
+all_zip_files <- list.files(data_path, pattern = "\\.zip$", full.names = TRUE)
+target_exclude <- "IHME-GBD_2023_DATA-4ee9b1e1-1.zip"
+target_files <- all_zip_files[!grepl(target_exclude, basename(all_zip_files))]
+gbd_all <- rbindlist(lapply(target_files, read_gbd_zip), fill = TRUE)
+
+# 1.2 Load and join population data
+pop_zip_path <- file.path(data_path, target_exclude)
+tmp_dir_pop <- tempdir()
+unzip(pop_zip_path, exdir = tmp_dir_pop)
+pop_file <- list.files(tmp_dir_pop, pattern = "\\.csv$", full.names = TRUE)
+gbd_pop <- read_csv(pop_file[1])
+
+gbd_all_joined <- gbd_all %>%
+  left_join(gbd_pop %>% select(location_id, year, age_id, sex_id, val), 
+            by = c("location_id", "year", "age_id", "sex_id"),
+            suffix = c("_rate", "_pop")) %>%
+  rename(population = val_pop)
+
+# ==========================================================
+# PART 2: Data Aggregation (Harmonizing Taiwan to China)
+# ==========================================================
+setDT(gbd_all_joined)
+gbd_all_joined[location_name == "Taiwan", location_name := "China"]
+
+cols_to_group <- c("location_name", "year", "sex_id", "sex_name", 
+                   "age_id", "age_name", "cause_id", "cause_name", 
+                   "measure_id", "measure_name", "metric_id", "metric_name")
+
+gbd_final <- gbd_all_joined[, .(
+  val_rate = sum(as.numeric(val_rate), na.rm = TRUE),
+  population = sum(as.numeric(population), na.rm = TRUE),
+  lower = sum(as.numeric(lower), na.rm = TRUE),
+  upper = sum(as.numeric(upper), na.rm = TRUE)
+), by = cols_to_group]
+
+# ==========================================================
+# PART 3: Process Data for Table & EAPC Calculation
+# ==========================================================
+location_order <- c("Global", "East Asia", "China", "Japan", 
+                    "Republic of Korea", "Democratic People's Republic of Korea", "Mongolia")
+measure_order <- c("Deaths", "Incidence", "Prevalence",
+                   "DALYs (Disability-Adjusted Life Years)",
+                   "YLLs (Years of Life Lost)",
+                   "YLDs (Years Lived with Disability)")
+
+table_base <- gbd_final %>%
   filter(sex_name == "Female", 
-         age_name %in% c("45-49 years", "50-54 years"),
-         metric_name %in% c("Number", "Rate")) %>%
+         age_name %in% c("45-49 years", "50-54 years"), 
+         location_name %in% location_order) %>%
   group_by(location_name, measure_name, year, metric_name) %>%
-  summarise(val = mean(val, na.rm = TRUE),
-            lower = mean(lower, na.rm = TRUE),
-            upper = mean(upper, na.rm = TRUE), .groups = "drop") %>%
+  summarise(
+    val = if(unique(metric_name) == "Rate") {
+      sum(val_rate * population, na.rm = TRUE) / sum(population, na.rm = TRUE)
+    } else {
+      sum(val_rate, na.rm = TRUE)
+    },
+    lower = mean(lower, na.rm = TRUE), 
+    upper = mean(upper, na.rm = TRUE), 
+    .groups = "drop"
+  ) %>%
   rename(location = location_name, measure = measure_name, metric = metric_name)
 
-# 3. Calculate EAPC (Based on Rate only!)
-eapc_res <- table_raw %>%
+# EAPC Calculation
+eapc_res <- table_base %>%
   filter(metric == "Rate") %>%
   group_by(location, measure) %>%
   do({
@@ -47,41 +104,41 @@ eapc_res <- table_raw %>%
     data.frame(eapc_fmt = paste0(sprintf("%.2f", val_eapc), " (", sprintf("%.2f", low_eapc), " to ", sprintf("%.2f", upp_eapc), ")"))
   })
 
-# 4. Prepare Final Table
-table_final <- table_raw %>%
+table_final <- table_base %>%
   filter(year %in% c(1990, 2023)) %>%
   mutate(ui_text = paste0(sprintf("%.2f", val), " (", sprintf("%.2f", lower), " to ", sprintf("%.2f", upper), ")")) %>%
   select(measure, location, year, metric, ui_text) %>%
   pivot_wider(names_from = c(year, metric), values_from = ui_text) %>%
   left_join(eapc_res, by = c("location", "measure"))
 
-# 5. GT Generation Function
+# ==========================================================
+# PART 4: Generate GT Tables
+# ==========================================================
 make_gt <- function(df) {
   df %>%
-    mutate(measure = factor(measure, levels = c("Deaths", "Incidence", "Prevalence", 
-                                                "DALYs (Disability-Adjusted Life Years)", 
-                                                "YLLs (Years of Life Lost)", 
-                                                "YLDs (Years Lived with Disability)"))) %>%
+    mutate(measure = factor(measure, levels = measure_order),
+           location = factor(location, levels = location_order)) %>%
     arrange(measure, location) %>%
     group_by(measure) %>%
     gt() %>%
     cols_label(
       location = "Location",
       `1990_Number` = "Number (95% UI)",
-      `1990_Rate` = "Rate per 100,000 (95% UI)",
+      `1990_Rate` = "Average Rate per 100,000 (95% UI)",
       `2023_Number` = "Number (95% UI)",
-      `2023_Rate` = "Rate per 100,000 (95% UI)",
+      `2023_Rate` = "Average Rate per 100,000 (95% UI)",
       eapc_fmt = "EAPC (95% UI)"
     ) %>%
     tab_spanner(label = "1990", columns = c(`1990_Number`, `1990_Rate`)) %>%
     tab_spanner(label = "2023", columns = c(`2023_Number`, `2023_Rate`)) %>%
     tab_spanner(label = "1990-2023", columns = c(eapc_fmt)) %>%
-    tab_options(table.font.names = "Arial", table.font.size = 12)
+    tab_options(table.font.names = "Arial", table.font.size = px(12)) %>%
+    cols_align(align = "left", columns = location)
 }
 
-# 6. Generate and Save
 table1 <- make_gt(table_final %>% filter(measure %in% c("Deaths", "Incidence", "Prevalence")))
 table2 <- make_gt(table_final %>% filter(measure %in% c("DALYs (Disability-Adjusted Life Years)", "YLLs (Years of Life Lost)", "YLDs (Years Lived with Disability)")))
-
+print(table1)
+print(table2)
 gtsave(table1, "table1.rtf")
 gtsave(table2, "table2.rtf")
