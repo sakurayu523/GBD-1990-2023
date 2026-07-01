@@ -8,7 +8,7 @@ library(patchwork)
 # ==========================================
 # 1. Setup and Data Loading
 # ==========================================
-data_path <- "F:/yu/GBD/female/data"
+data_path <- "your path"
 
 # Function to efficiently unzip and read CSVs
 read_gbd_zip <- function(zip_file) {
